@@ -12568,7 +12568,7 @@ function applySeed() {
   ['students', 'calendar', 'questions', 'exams', 'followups', 'exitTests', 'scoreSheets', 'materials', 'weekly'].forEach(function (c) {
     (Store.state[c] || []).forEach(function (r) { if (r && !r._demo) hasReal = true; });
   });
-  if (hasReal) { window.__seedApplied = true; return; }
+  if (hasReal) { localStorage.setItem('wbchem.seedInjected', '1'); window.__seedApplied = true; return; }
   /* 大数据量（图片 base64 内嵌在题目里）直接 clone 会翻倍占内存；
      seed 对象来自 fetch 的一次性解析，独占使用即可 */
   var sd = s.data;
@@ -12578,12 +12578,12 @@ function applySeed() {
      交给 persist()：它会把图片剥离进 IndexedDB，只落瘦身后的文本 */
   Store.state = sd;
   Store.persist();
+  /* 本机已成功注入标记：重载后不再重新下载 140MB 种子，也避免 hasReal 之外反复触发 */
+  localStorage.setItem('wbchem.seedInjected', '1');
   window.__seedApplied = true;
-  /* 注入后刷新界面，并兜底补一次图片加载 */
-  if (typeof Store.loadImgs === 'function') {
-    Store.loadImgs().then(function () { if (typeof App !== 'undefined' && App.refresh) App.refresh(); }).catch(function () { });
-  }
-  if (typeof App !== 'undefined' && App.refresh) App.refresh();
+  /* 注入成功后整页重载一次：从本地数据库（localStorage + IndexedDB）完整渲染，
+     避免只刷新当前视图导致数据“看不见” */
+  try { location.reload(true); } catch (e) { if (typeof App !== 'undefined' && App.refresh) App.refresh(); }
 }
 
 function enterApp() {
@@ -14239,36 +14239,59 @@ function boot() {
     deferredPrompt = e;
   });
   /* 公网种子：拉取同目录 seed.json（全量备份改名为 seed.json 即可）。
-     若题目被拆成 seed-q-N.json 分片（单文件超 GitHub 100MB 限制时），按序拉全、合并后才注入；
-     任何一片拉不到就放弃，避免半份数据写入。 */
+     题目被拆成 seed-q-N.json 分片（单文件超 GitHub 100MB 限制时），按序拉全、合并后才注入；
+     每个分片下载失败自动重试（最多 5 次）；全部拿到才写入。
+     本机已成功注入过（localStorage 标记 wbchem.seedInjected）则不再重新下载 140MB 种子。 */
   try {
-    fetch('seed.json', { cache: 'no-store' }).then(function (r) { return (r && r.ok) ? r.json() : null; })
-      .then(function (s) {
-        if (!s || !s.data) return null;
-        var shards = (s._qShards && Array.isArray(s._qShards)) ? s._qShards : [];
-        var fetchOne = function (name) {
-          return fetch(name, { cache: 'no-store' })
-            .then(function (r) { return (r && r.ok) ? r.json() : null; })
-            .catch(function () { return null; });
-        };
-        var load = function (i, acc) {
-          if (i >= shards.length) {
-            if (acc.some(function (x) { return !x; })) return null; /* 有分片失败 → 不注入 */
-            var qs = [];
-            acc.forEach(function (sh) { if (sh && Array.isArray(sh.questions)) qs = qs.concat(sh.questions); });
-            if (typeof s._qTotal === 'number' && qs.length !== s._qTotal) return null; /* 数目对不上 → 不注入 */
-            s.data.questions = qs;
-            window.__wbcSeed = s;
-            var lu = document.getElementById('loginUser');
-            if (lu && s.account) lu.value = s.account;
-            /* 种子可能在登录后才拉完：若已进入工作台，立即补注入 */
-            if (window.__appEntered && typeof applySeed === 'function') applySeed();
-            return null;
-          }
-          return fetchOne(shards[i]).then(function (sh) { acc.push(sh); return load(i + 1, acc); });
-        };
-        return load(0, []);
-      }).catch(function () { });
+    if (localStorage.getItem('wbchem.seedInjected')) { /* 已同步，跳过 */ }
+    else (function runSeed() {
+      var banner = function (msg, sticky) {
+        var el = document.getElementById('seedBanner');
+        if (!el) {
+          el = document.createElement('div'); el.id = 'seedBanner';
+          el.style.cssText = 'position:fixed;left:50%;top:14px;transform:translateX(-50%);z-index:99999;background:#2b6cb0;color:#fff;padding:9px 16px;border-radius:9px;font:14px/1.4 -apple-system,Segoe UI,sans-serif;box-shadow:0 3px 10px rgba(0,0,0,.25);max-width:90vw';
+          document.body.appendChild(el);
+        }
+        el.textContent = msg; el.style.display = '';
+        if (!sticky && msg.indexOf('正在') !== 0) setTimeout(function () { if (el.parentNode) el.parentNode.removeChild(el); }, 5000);
+      };
+      fetch('seed.json', { cache: 'no-store' })
+        .then(function (r) { return (r && r.ok) ? r.json() : Promise.reject(new Error('seed.json ' + (r ? r.status : 'net'))); })
+        .then(function (s) {
+          if (!s || !s.data) { banner('seed.json 无数据，未同步', true); return; }
+          var shards = (s._qShards && Array.isArray(s._qShards)) ? s._qShards : [];
+          var fetchOne = function (name, attempt) {
+            attempt = attempt || 1;
+            return fetch(name, { cache: 'no-store' })
+              .then(function (r) { return (r && r.ok) ? r.json() : Promise.reject(new Error('http' + (r ? r.status : 'net'))); })
+              .catch(function () {
+                if (attempt >= 5) { banner('分片 ' + name + ' 多次下载失败，无法同步，请刷新重试', true); return null; }
+                banner('分片 ' + name + ' 中断，重试 ' + attempt + '/5…', true);
+                return new Promise(function (res) { setTimeout(res, 1000 * attempt); }).then(function () { return fetchOne(name, attempt + 1); });
+              });
+          };
+          var load = function (i, acc) {
+            if (i >= shards.length) {
+              if (acc.some(function (x) { return !x; })) return; /* 失败提示已在 fetchOne 给出 */
+              var qs = [];
+              acc.forEach(function (sh) { if (sh && Array.isArray(sh.questions)) qs = qs.concat(sh.questions); });
+              if (typeof s._qTotal === 'number' && qs.length !== s._qTotal) { banner('分片题目数 ' + qs.length + ' ≠ 预期 ' + s._qTotal + '，未同步', true); return; }
+              s.data.questions = qs;
+              window.__wbcSeed = s;
+              var lu = document.getElementById('loginUser');
+              if (lu && s.account) lu.value = s.account;
+              try { var b = document.getElementById('seedBanner'); if (b) b.style.display = 'none'; } catch (e) { }
+              /* 种子可能在登录后才拉完：若已进入工作台立即补注入，否则登录时注入 */
+              if (window.__appEntered && typeof applySeed === 'function') applySeed();
+              return;
+            }
+            banner('正在同步题库数据… 分片 ' + (i + 1) + '/' + shards.length);
+            return fetchOne(shards[i]).then(function (sh) { acc.push(sh); return load(i + 1, acc); });
+          };
+          load(0, []);
+        })
+        .catch(function () { banner('种子读取失败，请刷新页面重试', true); });
+    })();
   } catch (e) { }
 }
 var cloudPushSoon = debounce(function () { Cloud.pushDirty(); }, 1500);
