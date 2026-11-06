@@ -12558,26 +12558,37 @@ function doLogin() {
   enterApp();
 }
 
+/* 公网种子注入：仅当本空间为空或仅有示例数据时写入；已有真实（非示例）数据则不动。
+   抽成函数，供「登录后」和「种子拉取完成后（可能晚于登录）」两处调用，消除竞态。 */
+function applySeed() {
+  if (window.__seedApplied) return;
+  var s = window.__wbcSeed;
+  if (!s || !s.data) return;
+  var hasReal = false;
+  ['students', 'calendar', 'questions', 'exams', 'followups', 'exitTests', 'scoreSheets', 'materials', 'weekly'].forEach(function (c) {
+    (Store.state[c] || []).forEach(function (r) { if (r && !r._demo) hasReal = true; });
+  });
+  if (hasReal) { window.__seedApplied = true; return; }
+  /* 大数据量（图片 base64 内嵌在题目里）直接 clone 会翻倍占内存；
+     seed 对象来自 fetch 的一次性解析，独占使用即可 */
+  var sd = s.data;
+  if (!sd.profile) sd.profile = {};
+  sd.profile.seeded = true;
+  /* 不要直接把全量 JSON 写 localStorage（图片 base64 会撑爆配额），
+     交给 persist()：它会把图片剥离进 IndexedDB，只落瘦身后的文本 */
+  Store.state = sd;
+  Store.persist();
+  window.__seedApplied = true;
+  /* 注入后刷新界面，并兜底补一次图片加载 */
+  if (typeof Store.loadImgs === 'function') {
+    Store.loadImgs().then(function () { if (typeof App !== 'undefined' && App.refresh) App.refresh(); }).catch(function () { });
+  }
+  if (typeof App !== 'undefined' && App.refresh) App.refresh();
+}
+
 function enterApp() {
-  /* 公网种子注入：仅当本空间为空或仅有示例数据时，用 seed.json 的内容写入；已有真实（非示例）数据则不动，避免覆盖 */
-  (function () {
-    var s = window.__wbcSeed;
-    if (!s || !s.data) return;
-    var hasReal = false;
-    ['students', 'calendar', 'questions', 'exams', 'followups', 'exitTests', 'scoreSheets', 'materials', 'weekly'].forEach(function (c) {
-      (Store.state[c] || []).forEach(function (r) { if (r && !r._demo) hasReal = true; });
-    });
-    if (hasReal) return;
-    /* 大数据量（图片 base64 内嵌在题目里）直接 clone 会翻倍占内存；
-       seed 对象来自 fetch 的一次性解析，独占使用即可 */
-    var sd = s.data;
-    if (!sd.profile) sd.profile = {};
-    sd.profile.seeded = true;
-    /* 不要直接把全量 JSON 写 localStorage（图片 base64 会撑爆配额），
-       交给 persist()：它会把图片剥离进 IndexedDB，只落瘦身后的文本 */
-    Store.state = sd;
-    Store.persist();
-  })();
+  window.__appEntered = true;
+  applySeed();
   /* 图片的 base64 存在 IndexedDB 里，异步取回后补上并重绘（界面先出，图片晚一拍到） */
   Store.loadImgs().then(function (n) {
     if (n) App.refresh();
@@ -14250,6 +14261,8 @@ function boot() {
             window.__wbcSeed = s;
             var lu = document.getElementById('loginUser');
             if (lu && s.account) lu.value = s.account;
+            /* 种子可能在登录后才拉完：若已进入工作台，立即补注入 */
+            if (window.__appEntered && typeof applySeed === 'function') applySeed();
             return null;
           }
           return fetchOne(shards[i]).then(function (sh) { acc.push(sh); return load(i + 1, acc); });
