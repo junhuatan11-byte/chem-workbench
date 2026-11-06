@@ -5814,6 +5814,7 @@ function renderSettings() {
   h += '<div class="card"><div class="card-h"><h3>备份与恢复</h3></div><div class="card-b">' +
     '<div style="display:flex;gap:8px;flex-wrap:wrap">' +
     '<button class="btn" data-act="backup-json"><svg><use href="#i-down"/></svg>导出 JSON 全量备份</button>' +
+    '<button class="btn" data-act="backup-seed"><svg><use href="#i-down"/></svg>导出公网种子(seed.json)</button>' +
     '<button class="btn" data-act="restore-json"><svg><use href="#i-up"/></svg>导入备份（合并）</button>' +
     '<button class="btn btn-danger" data-act="restore-json-replace">导入备份（覆盖）</button>' +
     '</div><div class="text-xs text-m mt8">合并：同 ID 取更新时间更晚的一条，不删除任何现有数据；覆盖：清空当前空间后完全恢复备份内容。</div></div></div>';
@@ -12558,6 +12559,25 @@ function doLogin() {
 }
 
 function enterApp() {
+  /* 公网种子注入：仅当本空间为空或仅有示例数据时，用 seed.json 的内容写入；已有真实（非示例）数据则不动，避免覆盖 */
+  (function () {
+    var s = window.__wbcSeed;
+    if (!s || !s.data) return;
+    var hasReal = false;
+    ['students', 'calendar', 'questions', 'exams', 'followups', 'exitTests', 'scoreSheets', 'materials', 'weekly'].forEach(function (c) {
+      (Store.state[c] || []).forEach(function (r) { if (r && !r._demo) hasReal = true; });
+    });
+    if (hasReal) return;
+    /* 大数据量（图片 base64 内嵌在题目里）直接 clone 会翻倍占内存；
+       seed 对象来自 fetch 的一次性解析，独占使用即可 */
+    var sd = s.data;
+    if (!sd.profile) sd.profile = {};
+    sd.profile.seeded = true;
+    /* 不要直接把全量 JSON 写 localStorage（图片 base64 会撑爆配额），
+       交给 persist()：它会把图片剥离进 IndexedDB，只落瘦身后的文本 */
+    Store.state = sd;
+    Store.persist();
+  })();
   /* 图片的 base64 存在 IndexedDB 里，异步取回后补上并重绘（界面先出，图片晚一拍到） */
   Store.loadImgs().then(function (n) {
     if (n) App.refresh();
@@ -13649,6 +13669,18 @@ function handleAct(act, el, id, col, e) {
     case 'backup-json':
       Files.downloadJSON('化学工作台备份_' + (Store.user ? Store.user.user : 'data') + '_' + todayStr() + '.json', Store.exportAll());
       return;
+    case 'backup-seed': {
+      var full = Store.exportAll();
+      var seed = {
+        _app: 'chem-workspace-seed', _ver: APP_VER, _at: new Date().toISOString(),
+        user: (Store.user ? Store.user.user : ''), code: (Store.user ? Store.user.code : ''),
+        data: full.data
+      };
+      if (seed.data && seed.data.profile) seed.data.profile.seeded = true;
+      Files.downloadJSON('chem-workbench-seed_' + todayStr() + '.json', seed);
+      UI.toast('已导出公网种子，把它上传到 GitHub 仓库根目录（覆盖同名文件）即可同步', 'ok');
+      return;
+    }
     case 'restore-json': restoreJSON('merge'); return;
     case 'restore-json-replace': restoreJSON('replace'); return;
     case 'clear-demo':
@@ -14195,6 +14227,36 @@ function boot() {
     e.preventDefault();
     deferredPrompt = e;
   });
+  /* 公网种子：拉取同目录 seed.json（全量备份改名为 seed.json 即可）。
+     若题目被拆成 seed-q-N.json 分片（单文件超 GitHub 100MB 限制时），按序拉全、合并后才注入；
+     任何一片拉不到就放弃，避免半份数据写入。 */
+  try {
+    fetch('seed.json', { cache: 'no-store' }).then(function (r) { return (r && r.ok) ? r.json() : null; })
+      .then(function (s) {
+        if (!s || !s.data) return null;
+        var shards = (s._qShards && Array.isArray(s._qShards)) ? s._qShards : [];
+        var fetchOne = function (name) {
+          return fetch(name, { cache: 'no-store' })
+            .then(function (r) { return (r && r.ok) ? r.json() : null; })
+            .catch(function () { return null; });
+        };
+        var load = function (i, acc) {
+          if (i >= shards.length) {
+            if (acc.some(function (x) { return !x; })) return null; /* 有分片失败 → 不注入 */
+            var qs = [];
+            acc.forEach(function (sh) { if (sh && Array.isArray(sh.questions)) qs = qs.concat(sh.questions); });
+            if (typeof s._qTotal === 'number' && qs.length !== s._qTotal) return null; /* 数目对不上 → 不注入 */
+            s.data.questions = qs;
+            window.__wbcSeed = s;
+            var lu = document.getElementById('loginUser');
+            if (lu && s.account) lu.value = s.account;
+            return null;
+          }
+          return fetchOne(shards[i]).then(function (sh) { acc.push(sh); return load(i + 1, acc); });
+        };
+        return load(0, []);
+      }).catch(function () { });
+  } catch (e) { }
 }
 var cloudPushSoon = debounce(function () { Cloud.pushDirty(); }, 1500);
 
